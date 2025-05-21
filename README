@@ -1,0 +1,14 @@
+Assignment from Chief Ammar. Link: https://t.me/GNUWeeb/1167135
+
+HTTP tracer via LD_PRELOAD
+------
+
+Usage:
+
+    make;
+    cp gwhttplogger.so /tmp/gwhttplogger.so;
+    env LD_PRELOAD=/tmp/gwhttplogger.so GWLOG_PATH=/tmp/http_log_curl.txt curl google.com;
+    env LD_PRELOAD=/tmp/gwhttplogger.so GWLOG_PATH=/tmp/http_log_firefox.txt firefox;
+
+-- 
+Alviro Iskandar Setiawan
