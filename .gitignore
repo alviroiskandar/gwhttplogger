@@ -1,1 +1,3 @@
 /gwhttplogger.so
+/http_log_curl.txt
+/http_log_firefox.txt
