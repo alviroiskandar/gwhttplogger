@@ -920,7 +920,7 @@ ssize_t send(int fd, const void *buf, size_t len, int flags)
 	return sendto(fd, buf, len, flags, nullptr, 0);
 }
 
-ssize_t read(int fd, void *buf, size_t len, int flags)
+ssize_t read(int fd, void *buf, size_t len)
 {
 	__asm__ volatile (
 		"syscall"
@@ -939,7 +939,7 @@ ssize_t read(int fd, void *buf, size_t len, int flags)
 	return len;
 }
 
-ssize_t write(int fd, const void *buf, size_t len, int flags)
+ssize_t write(int fd, const void *buf, size_t len)
 {
 	__asm__ volatile (
 		"syscall"
