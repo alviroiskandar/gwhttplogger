@@ -12,46 +12,24 @@
 #include <cctype>
 #include <ctime>
 
-#include <unistd.h>
-#include <arpa/inet.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <sys/syscall.h>
-
 #include <unordered_map>
 #include <memory>
 #include <queue>
 #include <mutex>
 #include <new>
 
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/syscall.h>
+
 #define noinline		__attribute__((__noinline__))
 #define likely(x)		__builtin_expect(!!(x), 1)
 #define unlikely(x)		__builtin_expect(!!(x), 0)
 #define ADDRPORT_STRLEN		(INET6_ADDRSTRLEN + (sizeof(":65535[]") - 1))
 #define MAX_HTTP_METHOD_LEN	16
-
-enum {
-	SK_STATE_INIT		= 0,
-	SK_STATE_CONNECT	= 1,
-
-	SK_STATE_HTTP_REQ_HDR	= 2,
-	SK_STATE_HTTP_REQ_BODY	= 3,
-	SK_STATE_HTTP_REQ_DONE	= 4,
-
-	SK_STATE_HTTP_RES_HDR	= 5,
-	SK_STATE_HTTP_RES_BODY	= 6,
-	SK_STATE_HTTP_RES_DONE	= 7,
-
-	SK_STATE_CLOSE		= 8,
-};
-
-struct ghl_addr {
-	union {
-		struct sockaddr sa;
-		struct sockaddr_in in;
-		struct sockaddr_in6 in6;
-	};
-};
+#define pr_debug(fmt, ...)	fprintf(stderr, fmt "\n", ##__VA_ARGS__)
 
 struct ghl_buf {
 	size_t	len;
@@ -88,7 +66,6 @@ struct ghl_buf {
 
 	void append(const char *data, size_t data_len)
 	{
-
 		if (this->len + data_len > this->cap) {
 			size_t new_cap = this->cap == 0 ? 4096 : this->cap * 2;
 			char *new_buf;
@@ -115,6 +92,21 @@ struct ghl_buf {
 	}
 };
 
+enum {
+	SK_STATE_INIT		= 0,
+	SK_STATE_CONNECT	= 1,
+
+	SK_STATE_HTTP_REQ_HDR	= 2,
+	SK_STATE_HTTP_REQ_BODY	= 3,
+	SK_STATE_HTTP_REQ_DONE	= 4,
+
+	SK_STATE_HTTP_RES_HDR	= 5,
+	SK_STATE_HTTP_RES_BODY	= 6,
+	SK_STATE_HTTP_RES_DONE	= 7,
+
+	SK_STATE_CLOSE		= 8,
+};
+
 struct http_res {
 	int		status;
 	uint64_t	content_length;
@@ -130,20 +122,13 @@ struct http_req {
 };
 
 struct ghl_sock {
-	uint8_t		state;
+	int		state;
 	int		fd;
+	char		dst_addr[ADDRPORT_STRLEN];
 	struct ghl_buf	send_buf;
 	struct ghl_buf	recv_buf;
-	struct ghl_addr addr;
 
 	std::queue<struct http_req> req_queue;
-
-	ghl_sock(void):
-		state(SK_STATE_INIT),
-		fd(-1)
-	{
-		memset(&addr, 0, sizeof(addr));
-	}
 };
 
 struct ghl_ctx {
@@ -152,259 +137,16 @@ struct ghl_ctx {
 	FILE *log_handle;
 };
 
-alignas(64) static char __ghl_ctx_alloc[sizeof(ghl_ctx)];
+alignas(64) static char __g_ctx[sizeof(ghl_ctx)];
 static struct ghl_ctx *g_ctx = nullptr;
 static volatile bool g_ghl_stop = false;
 static std::mutex g_init_lock;
-
-static void ghl_stop(void)
-{
-	struct ghl_ctx *c = g_ctx;
-	g_ghl_stop = true;
-	g_ctx = nullptr;
-	if (c) {
-		if (c->log_handle) {
-			fclose(c->log_handle);
-			c->log_handle = nullptr;
-		}
-		c->~ghl_ctx();
-	}
-}
-
-noinline
-static void ghl_init(void) noexcept
-{
-	try {
-		std::lock_guard<std::mutex> lock(g_init_lock);
-		char *log_file;
-
-		if (g_ctx)
-			return;
-
-		log_file = getenv("GWLOG_PATH");
-		if (!log_file) {
-			ghl_stop();
-			return;
-		}
-
-		g_ctx = new(__ghl_ctx_alloc) ghl_ctx();
-		g_ctx->log_handle = fopen(log_file, "a");
-		if (!g_ctx->log_handle) {
-			ghl_stop();
-			return;
-		}
-
-		setvbuf(g_ctx->log_handle, nullptr, _IOLBF, 0);
-	} catch (...) {
-		ghl_stop();
-	}
-}
-
-static void __ghl_kill_sock_trace(struct ghl_ctx *ctx, int fd)
-{
-	auto it = ctx->sockets.find(fd);
-	if (it != ctx->sockets.end())
-		ctx->sockets.erase(it);
-}
-
-static void ghl_kill_sock_trace(struct ghl_ctx *ctx, int fd)
-{
-	std::lock_guard<std::mutex> lock(ctx->sockets_lock);
-	__ghl_kill_sock_trace(ctx, fd);
-}
-
-static void __ghl_trace_socket(struct ghl_ctx *ctx, int fd, int domain, int type)
-{
-	/*
-	 * Only trace IPv4 and IPv6.
-	 */
-	if (domain != AF_INET && domain != AF_INET6)
-		return;
-
-	/*
-	 * Only trace TCP sockets.
-	 */
-	if (!(type & SOCK_STREAM))
-		return;
-
-	std::unique_ptr<struct ghl_sock> sk;
-	sk = std::make_unique<struct ghl_sock>();
-	sk->fd = fd;
-
-	std::lock_guard<std::mutex> lock(ctx->sockets_lock);
-	auto it = ctx->sockets.find(fd);
-	if (it == ctx->sockets.end())
-		ctx->sockets[fd] = std::move(sk);
-}
-
-static void __ghl_trace_connect(struct ghl_ctx *ctx, int fd, const struct sockaddr *addr)
-{
-	std::lock_guard<std::mutex> lock(ctx->sockets_lock);
-	auto it = ctx->sockets.find(fd);
-	if (it == ctx->sockets.end())
-		return;
-
-	if (addr->sa_family != AF_INET && addr->sa_family != AF_INET6) {
-		/*
-		 * Weird, the socket must've been confirmed that it's either
-		 * IPv4 or IPv6 in __ghl_trace_socket(), but the address it's
-		 * trying to connect to is not {IPv4 or IPv6}.
-		 *
-		 * Stop tracing this socket, something is wrong.
-		 */
-		__ghl_kill_sock_trace(ctx, fd);
-		return;
-	}
-
-	struct ghl_sock *sk = it->second.get();
-	if (sk->state != SK_STATE_INIT) {
-		/*
-		 * What? They call connect() twice on the same socket?
-		 *
-		 * Stop tracing this socket, something is wrong.
-		 */
-		__ghl_kill_sock_trace(ctx, fd);
-		return;
-	}
-
-	sk->state = SK_STATE_CONNECT;
-	if (addr->sa_family == AF_INET)
-		sk->addr.in = *reinterpret_cast<const struct sockaddr_in *>(addr);
-	else
-		sk->addr.in6 = *reinterpret_cast<const struct sockaddr_in6 *>(addr);
-}
 
 static void strtolower(char *str)
 {
 	char *p;
 	for (p = str; *p; p++)
 		*p = tolower((unsigned char)*p);
-}
-
-static int ghl_parse_http_res_hdr_line(char *line, struct http_res *res)
-{
-	char *key, *val, *val_end;
-
-	key = line;
-	val = strchr(line, ':');
-	if (!val)
-		return -EINVAL;
-
-	*val = '\0';
-	val += 1;
-	while (*val && isspace((unsigned char)*val))
-		val++;
-
-	val_end = strchr(val, '\r');
-	if (val_end)
-		*val_end = '\0';
-
-	strtolower(key);
-	if (strcmp(key, "content-length") == 0)
-		res->content_length = strtoull(val, nullptr, 10);
-
-	return 0;
-}
-
-static int __ghl_parse_http_res_hdr(struct ghl_sock *sk, struct http_res *res)
-{
-	char *buf = sk->recv_buf.buf;
-	char *line, *next_line;
-	size_t i = 0;
-
-	/*
-	 * Check if we have a complete HTTP response header.
-	 */
-	char *end = strstr(buf, "\r\n\r\n");
-
-	if (!end) {
-		/*
-		 * We don't have a complete HTTP response header yet.
-		 * Wait for more data.
-		 */
-		return -EAGAIN;
-	}
-
-	/*
-	 * We have a complete HTTP response header.
-	 * Parse the HTTP response header.
-	 */
-	line = buf;
-	while (1) {
-		next_line = strstr(line, "\r\n");
-		if (!next_line)
-			break;
-
-		*next_line = '\0';
-
-		if (i > 0) {
-			if (ghl_parse_http_res_hdr_line(line, res) < 0)
-				return -EINVAL;
-		} else {
-			char *status = strchr(line, ' ');
-			if (!status)
-				return -EINVAL;
-
-			*status = '\0';
-			status += 1;
-			res->status = atoi(status);
-			if (res->status < 100 || res->status > 599)
-				return -EINVAL;
-		}
-
-		line = next_line + 2;
-		if (line >= end)
-			break;
-
-		i++;
-	}
-
-	sk->recv_buf.advance(end - buf + 4);
-
-	if (sk->recv_buf.len < res->content_length)
-		return -EAGAIN;
-
-	return 0;
-}
-
-static int ghl_parse_http_res_hdr(struct ghl_sock *sk)
-{
-	struct http_res res;
-
-	if (sk->state != SK_STATE_HTTP_REQ_DONE)
-		return -EINVAL;
-
-	memset(&res, 0, sizeof(res));
-	int ret = __ghl_parse_http_res_hdr(sk, &res);
-	if (ret < 0)
-		return ret;
-
-	sk->req_queue.front().res = res;
-	if (res.content_length > 0)
-		sk->state = SK_STATE_HTTP_RES_BODY;
-	else
-		sk->state = SK_STATE_HTTP_RES_DONE;
-
-	return 0;
-}
-
-static int ghl_parse_http_res_body(struct ghl_sock *sk)
-{
-	size_t len = sk->recv_buf.len;
-	struct http_res *res;
-
-	if (sk->req_queue.empty())
-		return -EINVAL;
-
-	res = &sk->req_queue.front().res;
-	if (res->content_length < len)
-		len = res->content_length;
-
-	sk->recv_buf.advance(len);
-	res->content_length -= len;
-	if (!res->content_length)
-		sk->state = SK_STATE_HTTP_RES_DONE;
-	return 0;
 }
 
 static int sockaddr_to_str(const struct sockaddr *addr, char buf[ADDRPORT_STRLEN])
@@ -438,205 +180,91 @@ static int sockaddr_to_str(const struct sockaddr *addr, char buf[ADDRPORT_STRLEN
 	return 0;
 }
 
-static void ghl_save_log(struct ghl_ctx *ctx, struct ghl_sock *sk, struct http_req *req)
+static void __ghl_kill_sock_trace(struct ghl_ctx *ctx, int fd)
 {
-	char addr_buf[ADDRPORT_STRLEN];
-	char time_buf[64];
-	struct tm tm;
-
-	localtime_r(&req->time, &tm);
-	strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", &tm);
-	sockaddr_to_str(&sk->addr.sa, addr_buf);
-	fprintf(ctx->log_handle, "%s: DST=%s; HOST=%s; REQ=\"%s %s\"; RES_CODE=%d;\n",
-		time_buf, addr_buf, req->host, req->method, req->uri.c_str(), req->res.status);
+	auto it = ctx->sockets.find(fd);
+	if (it != ctx->sockets.end())
+		ctx->sockets.erase(it);
 }
 
-static int ghl_handle_http_res_done(struct ghl_ctx *ctx, struct ghl_sock *sk)
+static void __ghl_trace_socket(struct ghl_ctx *ctx, int fd, int domain, int type)
 {
-	if (sk->state != SK_STATE_HTTP_RES_DONE)
-		return -EINVAL;
+	/*
+	 * Only trace IPv4 and IPv6.
+	 */
+	if (domain != AF_INET && domain != AF_INET6)
+		return;
 
-	ghl_save_log(ctx, sk, &sk->req_queue.front());
-	sk->req_queue.pop();
-	if (sk->req_queue.empty())
-		sk->state = SK_STATE_HTTP_REQ_DONE;
-	else
-		sk->state = SK_STATE_HTTP_RES_HDR;
+	/*
+	 * Only trace TCP sockets.
+	 */
+	if (!(type & SOCK_STREAM))
+		return;
 
-	return 0;
+	std::unique_ptr<struct ghl_sock> sk = std::make_unique<struct ghl_sock>();
+	sk->fd = fd;
+
+	std::lock_guard<std::mutex> lock(ctx->sockets_lock);
+	auto it = ctx->sockets.find(fd);
+	if (it == ctx->sockets.end())
+		ctx->sockets[fd] = std::move(sk);
 }
 
-static void __ghl_trace_recv(struct ghl_ctx *ctx, int fd, const char *buf, ssize_t len)
+static void __ghl_trace_connect(struct ghl_ctx *ctx, int fd, int ret,
+				const struct sockaddr *addr)
+{
+	struct ghl_sock *sk;
+
+	/*
+	 * Successful connect() either returns 0 or -EINPROGRESS.
+	 */
+	if (ret != 0 && ret != -EINPROGRESS)
+		return;
+
+	std::lock_guard<std::mutex> lock(ctx->sockets_lock);
+	auto it = ctx->sockets.find(fd);
+	if (it == ctx->sockets.end())
+		return;
+
+	if (addr->sa_family != AF_INET && addr->sa_family != AF_INET6) {
+		/*
+		 * Weird, the socket must've been confirmed that it's either
+		 * IPv4 or IPv6 in __ghl_trace_socket(), but the address it's
+		 * trying to connect to is not {IPv4 or IPv6}.
+		 *
+		 * Stop tracing this socket, something is wrong.
+		 */
+		__ghl_kill_sock_trace(ctx, fd);
+		return;
+	}
+
+	sk = it->second.get();
+	if (sk->state != SK_STATE_INIT) {
+		/*
+		 * What? They call connect() twice on the same socket?
+		 *
+		 * Stop tracing this socket, something is wrong.
+		 */
+		__ghl_kill_sock_trace(ctx, fd);
+		return;
+	}
+
+	sk->state = SK_STATE_CONNECT;
+	sockaddr_to_str(addr, sk->dst_addr);
+}
+
+static void __ghl_trace_recv(struct ghl_ctx *ctx, int fd, const char *buf,
+			     ssize_t len)
 {
 	std::lock_guard<std::mutex> lock(ctx->sockets_lock);
-	int ret;
+	struct ghl_sock *sk;
 
 	auto it = ctx->sockets.find(fd);
 	if (it == ctx->sockets.end())
 		return;
 
-	struct ghl_sock *sk = it->second.get();
+	sk = it->second.get();
 	sk->recv_buf.append(buf, len);
-
-	if (sk->state <= SK_STATE_CONNECT) {
-		/*
-		 * Apparently, this is not an HTTP connection because we receive
-		 * the data before the HTTP request is sent.
-		 */
-		__ghl_kill_sock_trace(ctx, fd);
-		return;
-	}
-
-repeat:
-	switch (sk->state) {
-	case SK_STATE_HTTP_REQ_DONE:
-	case SK_STATE_HTTP_RES_HDR:
-		ret = ghl_parse_http_res_hdr(sk);
-		break;
-	case SK_STATE_HTTP_RES_BODY:
-		ret = ghl_parse_http_res_body(sk);
-		break;
-	default:
-		ret = -EINVAL;
-		break;
-	}
-
-	if (ret && ret != -EAGAIN) {
-		/*
-		 * We have an error, stop tracing this socket.
-		 */
-		__ghl_kill_sock_trace(ctx, fd);
-		return;
-	}
-
-	if (ret == -EAGAIN)
-		return;
-
-	if (sk->state == SK_STATE_HTTP_RES_DONE) {
-		ret = ghl_handle_http_res_done(ctx, sk);
-		if (ret < 0) {
-			__ghl_kill_sock_trace(ctx, fd);
-			return;
-		}
-	}
-
-	if (sk->recv_buf.len > 0)
-		goto repeat;
-}
-
-static int ghl_parse_http_req_hdr_line(char *line, struct http_req *req)
-{
-	char *key, *val, *val_end;
-
-	key = line;
-	val = strchr(line, ':');
-	if (!val)
-		return -EINVAL;
-
-	*val = '\0';
-	val += 1;
-	while (*val && isspace((unsigned char)*val))
-		val++;
-
-	val_end = strchr(val, '\r');
-	if (val_end)
-		*val_end = '\0';
-
-	strtolower(key);
-	if (strcmp(key, "host") == 0) {
-		strncpy(req->host, val, sizeof(req->host));
-		req->host[sizeof(req->host) - 1] = '\0';
-	} else if (strcmp(key, "content-length") == 0) {
-		req->content_length = strtoull(val, nullptr, 10);
-	}
-
-	return 0;
-}
-
-
-static int parse_method_and_uri(char *line, struct http_req *req)
-{
-	char *start, *end;
-
-	start = strchr(line, ' ');
-	if (!start)
-		return -EINVAL;
-
-	end = strchr(start + 1, ' ');
-	if (!end)
-		return -EINVAL;
-
-	*end = '\0';
-	*start = '\0';
-
-	strncpy(req->method, line, sizeof(req->method));
-	req->method[sizeof(req->method) - 1] = '\0';
-
-	req->uri = std::string(start + 1);
-	if (req->uri.empty())
-		return -EINVAL;
-
-	return 0;
-}
-
-static int __ghl_parse_http_req_hdr(struct ghl_sock *sk, struct http_req *req)
-{
-	char *buf = sk->send_buf.buf;
-	char *line, *next_line;
-	size_t i = 0;
-
-	/*
-	 * Check if we have a complete HTTP request header.
-	 */
-	char *end = strstr(buf, "\r\n\r\n");
-
-	if (!end) {
-		/*
-		 * We don't have a complete HTTP request header yet.
-		 * Wait for more data.
-		 */
-		return -EAGAIN;
-	}
-
-	/*
-	 * We have a complete HTTP request header.
-	 * Parse the HTTP request header.
-	 */
-	line = buf;
-	while (1) {
-		next_line = strstr(line, "\r\n");
-		if (!next_line)
-			break;
-
-		*next_line = '\0';
-
-		if (i > 0) {
-			if (ghl_parse_http_req_hdr_line(line, req) < 0)
-				return -EINVAL;
-		} else {
-			if (parse_method_and_uri(line, req) < 0)
-				return -EINVAL;
-		}
-
-		line = next_line + 2;
-		if (line >= end)
-			break;
-
-		i++;
-	}
-
-	sk->req_queue.push(*req);
-	if (req->content_length > 0)
-		sk->state = SK_STATE_HTTP_REQ_BODY;
-	else
-		sk->state = SK_STATE_HTTP_REQ_DONE;
-
-	sk->send_buf.advance(end - buf + 4);
-
-	if (sk->send_buf.len < req->content_length)
-		return -EAGAIN;
-
-	return 0;
 }
 
 static void init_http_req(struct http_req *req)
@@ -647,7 +275,59 @@ static void init_http_req(struct http_req *req)
 	req->content_length = 0;
 }
 
-static int ghl_parse_http_req_hdr(struct ghl_sock *sk)
+struct http_hdr_parse_st {
+	size_t	i;
+	char	*start;
+	char	*end;
+	char	*line;
+	char	*next_line;
+	char	*key;
+	char	*val;
+};
+
+static int ghl_parse_http_hdr(struct http_hdr_parse_st *s)
+{
+	s->i++;
+
+	if (!s->end) {
+		s->end = strstr(s->start, "\r\n\r\n");
+		if (!s->end)
+			return -EAGAIN;
+
+		s->end += 4;
+		s->line = s->start;
+	} else {
+		s->line = s->next_line;
+		if (!s->line)
+			return -EINVAL;
+	}
+
+	s->next_line = strstr(s->line, "\r\n");
+	if (!s->next_line)
+		return -EINVAL;
+
+	if (s->next_line + 2 == s->end)
+		return 0;
+
+	*s->next_line = '\0';
+	s->next_line += 2;
+
+	s->key = s->line;
+	s->val = strchr(s->line, ':');
+	if (!s->val) {
+		s->key = s->val = nullptr;
+		return 1;
+	}
+
+	*s->val = '\0';
+	s->val++;
+	while (isspace(*s->val))
+		s->val++;
+	strtolower(s->key);
+	return 1;
+}
+
+static int ghl_handle_state_connect(struct ghl_sock *sk)
 {
 	static const char *http_patterns[] = {
 		"GET /",
@@ -657,10 +337,10 @@ static int ghl_parse_http_req_hdr(struct ghl_sock *sk)
 		"HEAD /",
 		"OPTIONS /",
 		"PATCH /",
-		"CONNECT /",
 	};
 	size_t glen, len = sk->send_buf.len, i, c = sizeof(http_patterns) / sizeof(http_patterns[0]);
 	char *buf = sk->send_buf.buf;
+	struct http_hdr_parse_st hst;
 	bool possible_http = false;
 	struct http_req req;
 
@@ -681,41 +361,85 @@ static int ghl_parse_http_req_hdr(struct ghl_sock *sk)
 	if (!possible_http)
 		return -EINVAL;
 
-	return __ghl_parse_http_req_hdr(sk, &req);
-}
+	memset(&hst, 0, sizeof(hst));
+	hst.start = buf;
+	while (1) {
+		int ret = ghl_parse_http_hdr(&hst);
+		if (ret == -EAGAIN) {
+			/*
+			 * We don't have a complete HTTP request header yet.
+			 * Wait for more data.
+			 */
+			sk->state = SK_STATE_HTTP_REQ_HDR;
+			return ret;
+		}
 
-static int ghl_parse_http_req_body(struct ghl_sock *sk)
-{
-	size_t len = sk->send_buf.len;
-	struct http_req *req;
+		if (ret < 0)
+			return ret;
+		if (!ret)
+			break;
 
-	if (sk->req_queue.empty())
-		return -EINVAL;
+		if (hst.i == 1 && !hst.key) {
+			/* Parse method and URI. */
+			char *method = hst.line;
+			char *uri = strchr(hst.line, ' ');
+			char *end;
 
-	req = &sk->req_queue.front();
-	if (req->content_length < len)
-		len = req->content_length;
+			if (!uri)
+				return -EINVAL;
 
-	sk->send_buf.advance(len);
-	req->content_length -= len;
-	if (!req->content_length) {
-		sk->state = SK_STATE_HTTP_REQ_DONE;
-		req->time = time(nullptr);
+			*uri = '\0';
+			uri++;
+			if (*uri != '/')
+				return -EINVAL;
+
+			end = strstr(uri, " HTTP/1.");
+			if (!end)
+				return -EINVAL;
+			*end = '\0';
+
+			strncpy(req.method, method, sizeof(req.method) - 1);
+			req.method[sizeof(req.method) - 1] = '\0';
+			req.uri = std::string(uri);
+			continue;
+		}
+
+		if (!hst.key || !hst.val)
+			return -EINVAL;
+
+		if (!strcmp(hst.key, "host")) {
+			strncpy(req.host, hst.val, sizeof(req.host) - 1);
+			req.host[sizeof(req.host) - 1] = '\0';
+		} else if (!strncmp(hst.key, "content-length", 14)) {
+			char *endptr;
+			errno = 0;
+			req.content_length = strtoull(hst.val, &endptr, 10);
+			if (errno || *endptr != '\0')
+				return -EINVAL;
+		}
 	}
+	sk->state = SK_STATE_HTTP_REQ_BODY;
+	sk->req_queue.push(req);
+	sk->send_buf.advance(hst.end - sk->send_buf.buf);
+	if (!req.content_length)
+		sk->state = SK_STATE_HTTP_REQ_DONE;
 
+	pr_debug("HTTP request: %s %s %s", req.method, req.uri.c_str(), req.host);
 	return 0;
 }
 
-static void __ghl_trace_send(struct ghl_ctx *ctx, int fd, const char *buf, ssize_t len)
+static void __ghl_trace_send(struct ghl_ctx *ctx, int fd, const char *buf,
+			     ssize_t len)
 {
 	std::lock_guard<std::mutex> lock(ctx->sockets_lock);
-	int ret;
+	struct ghl_sock *sk;
+	int ret = -EINVAL;
 
 	auto it = ctx->sockets.find(fd);
 	if (it == ctx->sockets.end())
 		return;
 
-	struct ghl_sock *sk = it->second.get();
+	sk = it->second.get();
 	sk->send_buf.append(buf, len);
 
 repeat:
@@ -723,23 +447,24 @@ repeat:
 	case SK_STATE_CONNECT:
 	case SK_STATE_HTTP_REQ_HDR:
 	case SK_STATE_HTTP_REQ_DONE:
-		ret = ghl_parse_http_req_hdr(sk);
+		ret = ghl_handle_state_connect(sk);
 		break;
 	case SK_STATE_HTTP_REQ_BODY:
-		ret = ghl_parse_http_req_body(sk);
 		break;
+	case SK_STATE_INIT:
 	default:
-		ret = -EINVAL;
-		break;
-	}
-
-	if (ret && ret != -EAGAIN) {
+		/* Shouldn't happen, but just in case... */
 		__ghl_kill_sock_trace(ctx, fd);
 		return;
 	}
 
 	if (ret == -EAGAIN)
 		return;
+
+	if (ret < 0) {
+		__ghl_kill_sock_trace(ctx, fd);
+		return;
+	}
 
 	if (sk->send_buf.len > 0)
 		goto repeat;
@@ -748,7 +473,55 @@ repeat:
 static void __ghl_trace_close(struct ghl_ctx *ctx, int fd)
 {
 	std::lock_guard<std::mutex> lock(ctx->sockets_lock);
-	__ghl_kill_sock_trace(ctx, fd);
+	auto it = ctx->sockets.find(fd);
+	if (it != ctx->sockets.end())
+		__ghl_kill_sock_trace(ctx, fd);
+}
+
+noinline
+static void ghl_stop(void)
+{
+	struct ghl_ctx *c = g_ctx;
+
+	g_ghl_stop = true;
+	g_ctx = nullptr;
+
+	if (c) {
+		if (c->log_handle) {
+			fclose(c->log_handle);
+			c->log_handle = nullptr;
+		}
+		c->~ghl_ctx();
+	}
+}
+
+noinline
+static void ghl_init(void)
+{
+	try {
+		std::lock_guard<std::mutex> lock(g_init_lock);
+		char *log_file;
+
+		if (g_ctx)
+			return;
+
+		log_file = getenv("GWLOG_PATH");
+		if (!log_file) {
+			ghl_stop();
+			return;
+		}
+
+		g_ctx = new(__g_ctx) ghl_ctx();
+		g_ctx->log_handle = fopen(log_file, "a");
+		if (!g_ctx->log_handle) {
+			ghl_stop();
+			return;
+		}
+
+		setvbuf(g_ctx->log_handle, nullptr, _IOLBF, 0);
+	} catch (...) {
+		ghl_stop();
+	}
 }
 
 noinline
@@ -765,13 +538,13 @@ static void ghl_trace_socket(int fd, int domain, int type) noexcept
 }
 
 noinline
-static void ghl_trace_connect(int fd, const struct sockaddr *addr) noexcept
+static void ghl_trace_connect(int fd, int ret, const struct sockaddr *addr) noexcept
 {
 	if (!g_ctx || g_ghl_stop)
 		return;
 
 	try {
-		__ghl_trace_connect(g_ctx, fd, addr);
+		__ghl_trace_connect(g_ctx, fd, ret, addr);
 	} catch (...) {
 		ghl_stop();
 	}
@@ -829,13 +602,13 @@ int socket(int domain, int type, int protocol)
 		: "rcx", "r11", "memory"
 	);
 
-	if (ret < 0) {
-		errno = -ret;
-		ret = -1;
-	} else {
+	if (likely(ret >= 0)) {
 		if (unlikely(!g_ctx))
 			ghl_init();
 		ghl_trace_socket(ret, domain, type);
+	} else {
+		errno = -ret;
+		ret = -1;
 	}
 
 	return ret;
@@ -852,12 +625,13 @@ int connect(int fd, const struct sockaddr *addr, socklen_t addrlen)
 		: "rcx", "r11", "memory"
 	);
 
+	ghl_trace_connect(fd, ret, addr);
+
 	if (ret < 0) {
 		errno = -ret;
 		ret = -1;
 	}
 
-	ghl_trace_connect(fd, addr);
 	return ret;
 }
 
@@ -877,11 +651,11 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
 		: "rcx", "r11", "memory"
 	);
 
-	if (ret < 0) {
+	if (likely(ret >= 0)) {
+		ghl_trace_recv(fd, static_cast<const char *>(buf), ret);
+	} else {
 		errno = -ret;
 		ret = -1;
-	} else {
-		ghl_trace_recv(fd, static_cast<const char *>(buf), ret);
 	}
 
 	return ret;
@@ -903,11 +677,11 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
 		: "rcx", "r11", "memory"
 	);
 
-	if (ret < 0) {
+	if (likely(ret >= 0)) {
+		ghl_trace_send(fd, static_cast<const char *>(buf), ret);
+	} else {
 		errno = -ret;
 		ret = -1;
-	} else {
-		ghl_trace_send(fd, static_cast<const char *>(buf), len);
 	}
 
 	return ret;
@@ -934,11 +708,11 @@ ssize_t read(int fd, void *buf, size_t len)
 		: "rcx", "r11", "memory"
 	);
 
-	if (ret < 0) {
+	if (likely(ret >= 0)) {
+		ghl_trace_recv(fd, static_cast<const char *>(buf), ret);
+	} else {
 		errno = -ret;
 		ret = -1;
-	} else {
-		ghl_trace_recv(fd, static_cast<const char *>(buf), ret);
 	}
 
 	return ret;
@@ -955,11 +729,11 @@ ssize_t write(int fd, const void *buf, size_t len)
 		: "rcx", "r11", "memory"
 	);
 
-	if (ret < 0) {
+	if (likely(ret >= 0)) {
+		ghl_trace_send(fd, static_cast<const char *>(buf), len);
+	} else {
 		errno = -ret;
 		ret = -1;
-	} else {
-		ghl_trace_send(fd, static_cast<const char *>(buf), len);
 	}
 
 	return ret;
