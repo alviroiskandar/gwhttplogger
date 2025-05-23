@@ -745,9 +745,7 @@ repeat:
 static void __ghl_trace_close(struct ghl_ctx *ctx, int fd)
 {
 	std::lock_guard<std::mutex> lock(ctx->sockets_lock);
-	auto it = ctx->sockets.find(fd);
-	if (it != ctx->sockets.end())
-		__ghl_kill_sock_trace(ctx, fd);
+	__ghl_kill_sock_trace(ctx, fd);
 }
 
 noinline
@@ -876,10 +874,11 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
 		: "rcx", "r11", "memory"
 	);
 
-	ghl_trace_recv(fd, static_cast<const char *>(buf), ret);
 	if (ret < 0) {
 		errno = -ret;
 		ret = -1;
+	} else {
+		ghl_trace_recv(fd, static_cast<const char *>(buf), ret);
 	}
 
 	return ret;
@@ -901,10 +900,11 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
 		: "rcx", "r11", "memory"
 	);
 
-	ghl_trace_send(fd, static_cast<const char *>(buf), len);
 	if (ret < 0) {
 		errno = -ret;
 		ret = -1;
+	} else {
+		ghl_trace_send(fd, static_cast<const char *>(buf), len);
 	}
 
 	return ret;
@@ -918,6 +918,44 @@ ssize_t recv(int fd, void *buf, size_t len, int flags)
 ssize_t send(int fd, const void *buf, size_t len, int flags)
 {
 	return sendto(fd, buf, len, flags, nullptr, 0);
+}
+
+ssize_t read(int fd, void *buf, size_t len, int flags)
+{
+	__asm__ volatile (
+		"syscall"
+		: "=a" (len)
+		: "a" (__NR_read), "D" (fd), "S" (buf), "d" (len)
+		: "rcx", "r11", "memory"
+	);
+
+	if (len < 0) {
+		errno = -len;
+		len = -1;
+	} else {
+		ghl_trace_recv(fd, static_cast<const char *>(buf), len);
+	}
+
+	return len;
+}
+
+ssize_t write(int fd, const void *buf, size_t len, int flags)
+{
+	__asm__ volatile (
+		"syscall"
+		: "=a" (len)
+		: "a" (__NR_write), "D" (fd), "S" (buf), "d" (len)
+		: "rcx", "r11", "memory"
+	);
+
+	if (len < 0) {
+		errno = -len;
+		len = -1;
+	} else {
+		ghl_trace_send(fd, static_cast<const char *>(buf), len);
+	}
+
+	return len;
 }
 
 int close(int fd)
