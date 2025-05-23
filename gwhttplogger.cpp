@@ -66,6 +66,9 @@ struct ghl_buf {
 
 	void append(const char *data, size_t data_len)
 	{
+		if (!data_len)
+			return;
+
 		if (this->len + data_len > this->cap) {
 			size_t new_cap = this->cap == 0 ? 4096 : this->cap * 2;
 			char *new_buf;
@@ -736,6 +739,9 @@ static void ghl_trace_connect(int fd, int ret, const struct sockaddr *addr) noex
 noinline
 static void ghl_trace_recv(int fd, const char *buf, ssize_t len) noexcept
 {
+	if (len <= 0)
+		return;
+
 	if (!g_ctx || g_ghl_stop)
 		return;
 
@@ -749,6 +755,9 @@ static void ghl_trace_recv(int fd, const char *buf, ssize_t len) noexcept
 noinline
 static void ghl_trace_send(int fd, const char *buf, ssize_t len) noexcept
 {
+	if (len <= 0)
+		return;
+
 	if (!g_ctx || g_ghl_stop)
 		return;
 
