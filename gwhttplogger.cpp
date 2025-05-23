@@ -327,6 +327,51 @@ static int ghl_parse_http_hdr(struct http_hdr_parse_st *s)
 	return 1;
 }
 
+static int ghl_http_hdr_parse_proc(struct http_hdr_parse_st &hst,
+				   struct http_req &req)
+{
+	if (hst.i == 1 && !hst.key) {
+		/* Parse method and URI. */
+		char *method = hst.line;
+		char *uri = strchr(hst.line, ' ');
+		char *end;
+
+		if (!uri)
+			return -EINVAL;
+
+		*uri = '\0';
+		uri++;
+		if (*uri != '/')
+			return -EINVAL;
+
+		end = strstr(uri, " HTTP/1.");
+		if (!end)
+			return -EINVAL;
+		*end = '\0';
+
+		strncpy(req.method, method, sizeof(req.method) - 1);
+		req.method[sizeof(req.method) - 1] = '\0';
+		req.uri = std::string(uri);
+		return 0;
+	}
+
+	if (!hst.key || !hst.val)
+		return -EINVAL;
+
+	if (!strcmp(hst.key, "host")) {
+		strncpy(req.host, hst.val, sizeof(req.host) - 1);
+		req.host[sizeof(req.host) - 1] = '\0';
+	} else if (!strncmp(hst.key, "content-length", 14)) {
+		char *endptr;
+		errno = 0;
+		req.content_length = strtoull(hst.val, &endptr, 10);
+		if (errno || *endptr != '\0')
+			return -EINVAL;
+	}
+
+	return 0;
+}
+
 static int ghl_handle_state_req_connect(struct ghl_sock *sk)
 {
 	static const char *http_patterns[] = {
@@ -379,44 +424,8 @@ static int ghl_handle_state_req_connect(struct ghl_sock *sk)
 		if (!ret)
 			break;
 
-		if (hst.i == 1 && !hst.key) {
-			/* Parse method and URI. */
-			char *method = hst.line;
-			char *uri = strchr(hst.line, ' ');
-			char *end;
-
-			if (!uri)
-				return -EINVAL;
-
-			*uri = '\0';
-			uri++;
-			if (*uri != '/')
-				return -EINVAL;
-
-			end = strstr(uri, " HTTP/1.");
-			if (!end)
-				return -EINVAL;
-			*end = '\0';
-
-			strncpy(req.method, method, sizeof(req.method) - 1);
-			req.method[sizeof(req.method) - 1] = '\0';
-			req.uri = std::string(uri);
-			continue;
-		}
-
-		if (!hst.key || !hst.val)
+		if (ghl_http_hdr_parse_proc(hst, req) < 0)
 			return -EINVAL;
-
-		if (!strcmp(hst.key, "host")) {
-			strncpy(req.host, hst.val, sizeof(req.host) - 1);
-			req.host[sizeof(req.host) - 1] = '\0';
-		} else if (!strncmp(hst.key, "content-length", 14)) {
-			char *endptr;
-			errno = 0;
-			req.content_length = strtoull(hst.val, &endptr, 10);
-			if (errno || *endptr != '\0')
-				return -EINVAL;
-		}
 	}
 
 	req.time = time(nullptr);
