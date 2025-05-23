@@ -925,40 +925,44 @@ ssize_t send(int fd, const void *buf, size_t len, int flags)
 
 ssize_t read(int fd, void *buf, size_t len)
 {
+	ssize_t ret;
+
 	__asm__ volatile (
 		"syscall"
-		: "=a" (len)
+		: "=a" (ret)
 		: "a" (__NR_read), "D" (fd), "S" (buf), "d" (len)
 		: "rcx", "r11", "memory"
 	);
 
-	if (len < 0) {
-		errno = -len;
-		len = -1;
+	if (ret < 0) {
+		errno = -ret;
+		ret = -1;
 	} else {
-		ghl_trace_recv(fd, static_cast<const char *>(buf), len);
+		ghl_trace_recv(fd, static_cast<const char *>(buf), ret);
 	}
 
-	return len;
+	return ret;
 }
 
 ssize_t write(int fd, const void *buf, size_t len)
 {
+	ssize_t ret;
+
 	__asm__ volatile (
 		"syscall"
-		: "=a" (len)
+		: "=a" (ret)
 		: "a" (__NR_write), "D" (fd), "S" (buf), "d" (len)
 		: "rcx", "r11", "memory"
 	);
 
-	if (len < 0) {
-		errno = -len;
-		len = -1;
+	if (ret < 0) {
+		errno = -ret;
+		ret = -1;
 	} else {
 		ghl_trace_send(fd, static_cast<const char *>(buf), len);
 	}
 
-	return len;
+	return ret;
 }
 
 int close(int fd)
