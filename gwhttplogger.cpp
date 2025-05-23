@@ -126,6 +126,7 @@ struct http_req {
 	char		host[512];
 	uint64_t	content_length;
 	struct http_res	res;
+	time_t		time;
 };
 
 struct ghl_sock {
@@ -441,10 +442,9 @@ static void ghl_save_log(struct ghl_ctx *ctx, struct ghl_sock *sk, struct http_r
 {
 	char addr_buf[ADDRPORT_STRLEN];
 	char time_buf[64];
-	time_t now = time(nullptr);
 	struct tm tm;
 
-	localtime_r(&now, &tm);
+	localtime_r(&req->time, &tm);
 	strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", &tm);
 	sockaddr_to_str(&sk->addr.sa, addr_buf);
 	fprintf(ctx->log_handle, "%s: DST=%s; HOST=%s; REQ=\"%s %s\"; RES_CODE=%d;\n",
@@ -698,8 +698,11 @@ static int ghl_parse_http_req_body(struct ghl_sock *sk)
 
 	sk->send_buf.advance(len);
 	req->content_length -= len;
-	if (!req->content_length)
+	if (!req->content_length) {
 		sk->state = SK_STATE_HTTP_REQ_DONE;
+		req->time = time(nullptr);
+	}
+
 	return 0;
 }
 
