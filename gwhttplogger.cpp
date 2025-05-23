@@ -327,7 +327,7 @@ static int ghl_parse_http_hdr(struct http_hdr_parse_st *s)
 	return 1;
 }
 
-static int ghl_handle_state_connect(struct ghl_sock *sk)
+static int ghl_handle_state_req_connect(struct ghl_sock *sk)
 {
 	static const char *http_patterns[] = {
 		"GET /",
@@ -418,14 +418,36 @@ static int ghl_handle_state_connect(struct ghl_sock *sk)
 				return -EINVAL;
 		}
 	}
+
+	req.time = time(nullptr);
 	sk->state = SK_STATE_HTTP_REQ_BODY;
 	sk->req_queue.push(req);
 	sk->send_buf.advance(hst.end - sk->send_buf.buf);
+
 	if (!req.content_length)
 		sk->state = SK_STATE_HTTP_REQ_DONE;
+	else
+		sk->state = SK_STATE_HTTP_REQ_BODY;
 
-	pr_debug("HTTP request: %s %s %s", req.method, req.uri.c_str(), req.host);
 	return 0;
+}
+
+static int ghl_handle_state_req_body(struct ghl_sock *sk)
+{
+	struct http_req *req = &sk->req_queue.back();
+	size_t sub_len = req->content_length;
+
+	if (sub_len <= sk->send_buf.len) {
+		/* Either we have the whole body or more... */
+		sk->send_buf.advance(sub_len);
+		sk->state = SK_STATE_HTTP_REQ_DONE;
+		req->content_length = 0;
+		return 0;
+	} else {
+		/* We don't have the whole body yet. */
+		sk->state = SK_STATE_HTTP_REQ_BODY;
+		return -EAGAIN;
+	}
 }
 
 static void __ghl_trace_send(struct ghl_ctx *ctx, int fd, const char *buf,
@@ -447,27 +469,26 @@ repeat:
 	case SK_STATE_CONNECT:
 	case SK_STATE_HTTP_REQ_HDR:
 	case SK_STATE_HTTP_REQ_DONE:
-		ret = ghl_handle_state_connect(sk);
+		ret = ghl_handle_state_req_connect(sk);
 		break;
 	case SK_STATE_HTTP_REQ_BODY:
+		ret = ghl_handle_state_req_body(sk);
 		break;
 	case SK_STATE_INIT:
 	default:
 		/* Shouldn't happen, but just in case... */
-		__ghl_kill_sock_trace(ctx, fd);
-		return;
+		goto kill;
 	}
-
 	if (ret == -EAGAIN)
 		return;
-
-	if (ret < 0) {
-		__ghl_kill_sock_trace(ctx, fd);
-		return;
-	}
-
+	if (ret < 0)
+		goto kill;
 	if (sk->send_buf.len > 0)
 		goto repeat;
+
+	return;
+kill:
+	__ghl_kill_sock_trace(ctx, fd);
 }
 
 static void __ghl_trace_close(struct ghl_ctx *ctx, int fd)
