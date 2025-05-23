@@ -110,6 +110,7 @@ enum {
 struct http_res {
 	int		status;
 	uint64_t	content_length;
+	uint64_t	remaining_content_length;
 };
 
 struct http_req {
@@ -117,6 +118,7 @@ struct http_req {
 	std::string	uri;
 	char		host[512];
 	uint64_t	content_length;
+	uint64_t	remaining_content_length;
 	struct http_res	res;
 	time_t		time;
 };
@@ -253,20 +255,6 @@ static void __ghl_trace_connect(struct ghl_ctx *ctx, int fd, int ret,
 	sockaddr_to_str(addr, sk->dst_addr);
 }
 
-static void __ghl_trace_recv(struct ghl_ctx *ctx, int fd, const char *buf,
-			     ssize_t len)
-{
-	std::lock_guard<std::mutex> lock(ctx->sockets_lock);
-	struct ghl_sock *sk;
-
-	auto it = ctx->sockets.find(fd);
-	if (it == ctx->sockets.end())
-		return;
-
-	sk = it->second.get();
-	sk->recv_buf.append(buf, len);
-}
-
 static void init_http_req(struct http_req *req)
 {
 	req->method[0] = '\0';
@@ -327,8 +315,8 @@ static int ghl_parse_http_hdr(struct http_hdr_parse_st *s)
 	return 1;
 }
 
-static int ghl_http_hdr_parse_proc(struct http_hdr_parse_st &hst,
-				   struct http_req &req)
+static int ghl_http_req_hdr_parse_proc(struct http_hdr_parse_st &hst,
+				       struct http_req &req)
 {
 	if (hst.i == 1 && !hst.key) {
 		/* Parse method and URI. */
@@ -365,6 +353,7 @@ static int ghl_http_hdr_parse_proc(struct http_hdr_parse_st &hst,
 		char *endptr;
 		errno = 0;
 		req.content_length = strtoull(hst.val, &endptr, 10);
+		req.remaining_content_length = req.content_length;
 		if (errno || *endptr != '\0')
 			return -EINVAL;
 	}
@@ -424,7 +413,7 @@ static int ghl_handle_state_req_connect(struct ghl_sock *sk)
 		if (!ret)
 			break;
 
-		if (ghl_http_hdr_parse_proc(hst, req) < 0)
+		if (ghl_http_req_hdr_parse_proc(hst, req) < 0)
 			return -EINVAL;
 	}
 
@@ -444,16 +433,17 @@ static int ghl_handle_state_req_connect(struct ghl_sock *sk)
 static int ghl_handle_state_req_body(struct ghl_sock *sk)
 {
 	struct http_req *req = &sk->req_queue.back();
-	size_t sub_len = req->content_length;
 
-	if (sub_len <= sk->send_buf.len) {
+	if (req->remaining_content_length <= sk->send_buf.len) {
 		/* Either we have the whole body or more... */
-		sk->send_buf.advance(sub_len);
+		sk->send_buf.advance(req->remaining_content_length);
 		sk->state = SK_STATE_HTTP_REQ_DONE;
-		req->content_length = 0;
+		req->remaining_content_length = 0;
 		return 0;
 	} else {
 		/* We don't have the whole body yet. */
+		req->remaining_content_length -= sk->send_buf.len;
+		sk->send_buf.reset();
 		sk->state = SK_STATE_HTTP_REQ_BODY;
 		return -EAGAIN;
 	}
@@ -478,6 +468,7 @@ repeat:
 	case SK_STATE_CONNECT:
 	case SK_STATE_HTTP_REQ_HDR:
 	case SK_STATE_HTTP_REQ_DONE:
+	case SK_STATE_HTTP_RES_DONE:
 		ret = ghl_handle_state_req_connect(sk);
 		break;
 	case SK_STATE_HTTP_REQ_BODY:
@@ -493,6 +484,168 @@ repeat:
 	if (ret < 0)
 		goto kill;
 	if (sk->send_buf.len > 0)
+		goto repeat;
+
+	return;
+kill:
+	__ghl_kill_sock_trace(ctx, fd);
+}
+
+static int ghl_http_res_hdr_parse_proc(struct http_hdr_parse_st &hst,
+				    struct http_res &res)
+{
+	if (hst.i == 1 && !hst.key) {
+		/* Parse status code. */
+		char *status = hst.line;
+		char *end;
+
+		end = strchr(status, ' ');
+		if (!end)
+			return -EINVAL;
+
+		*end = '\0';
+		end++;
+		res.status = atoi(end);
+		if (res.status < 100 || res.status > 599)
+			return -EINVAL;
+
+		return 0;
+	}
+
+	if (!hst.key || !hst.val)
+		return -EINVAL;
+
+	if (!strcmp(hst.key, "content-length")) {
+		char *endptr;
+		errno = 0;
+		res.content_length = strtoull(hst.val, &endptr, 10);
+		res.remaining_content_length = res.content_length;
+		if (errno || *endptr != '\0')
+			return -EINVAL;
+	}
+
+	return 0;
+}
+
+static int ghl_handle_state_res_hdr(struct ghl_sock *sk)
+{
+	struct http_res *res = &sk->req_queue.front().res;
+	struct http_hdr_parse_st hst;
+	int ret;
+
+	memset(&hst, 0, sizeof(hst));
+	hst.start = sk->recv_buf.buf;
+
+	while (1) {
+		ret = ghl_parse_http_hdr(&hst);
+		if (ret == -EAGAIN) {
+			/*
+			 * We don't have a complete HTTP response header yet.
+			 * Wait for more data.
+			 */
+			sk->state = SK_STATE_HTTP_RES_HDR;
+			return ret;
+		}
+
+		if (ret < 0)
+			return ret;
+		if (!ret)
+			break;
+
+		if (ghl_http_res_hdr_parse_proc(hst, *res) < 0)
+			return -EINVAL;
+	}
+
+	sk->recv_buf.advance(hst.end - sk->recv_buf.buf);
+	if (res->content_length == 0)
+		sk->state = SK_STATE_HTTP_RES_DONE;
+	else
+		sk->state = SK_STATE_HTTP_RES_BODY;
+
+	return 0;
+}
+
+static int ghl_handle_state_res_body(struct ghl_sock *sk)
+{
+	struct http_res *res = &sk->req_queue.front().res;
+
+	if (res->remaining_content_length <= sk->recv_buf.len) {
+		/* Either we have the whole body or more... */
+		sk->recv_buf.advance(res->remaining_content_length);
+		sk->state = SK_STATE_HTTP_RES_DONE;
+		res->remaining_content_length = 0;
+		return 0;
+	} else {
+		/* We don't have the whole body yet. */
+		res->remaining_content_length -= sk->recv_buf.len;
+		sk->recv_buf.reset();
+		sk->state = SK_STATE_HTTP_RES_BODY;
+		return -EAGAIN;
+	}
+}
+
+static void ghl_log_http_req(struct ghl_ctx *ctx, struct ghl_sock *sk)
+{
+	struct http_req *req = &sk->req_queue.front();
+	struct http_res *res = &req->res;
+	char time_buf[64];
+	struct tm tm;
+
+	localtime_r(&req->time, &tm);
+	strftime(time_buf, sizeof(time_buf), "%Y-%m-%d %H:%M:%S", &tm);
+	fprintf(ctx->log_handle, "%s: DST=\"%s\"; HOST=\"%s\"; REQ=\"%s %s\"; RES_CODE=\"%d\";\n",
+		time_buf, sk->dst_addr, req->host, req->method, req->uri.c_str(),
+		res->status);
+
+	sk->req_queue.pop();
+}
+
+static void __ghl_trace_recv(struct ghl_ctx *ctx, int fd, const char *buf,
+			     ssize_t len)
+{
+	std::lock_guard<std::mutex> lock(ctx->sockets_lock);
+	struct ghl_sock *sk;
+	int ret = -EINVAL;
+
+	auto it = ctx->sockets.find(fd);
+	if (it == ctx->sockets.end())
+		return;
+
+	sk = it->second.get();
+	if (sk->state <= SK_STATE_CONNECT || sk->req_queue.empty()) {
+		/*
+		 * This is not an HTTP request because the server sent
+		 * something before the client sent the request.
+		 */
+		__ghl_kill_sock_trace(ctx, fd);
+		return;
+	}
+
+	sk->recv_buf.append(buf, len);
+
+repeat:
+	switch (sk->state) {
+	case SK_STATE_HTTP_RES_DONE:
+	case SK_STATE_HTTP_REQ_DONE:
+	case SK_STATE_HTTP_RES_HDR:
+		ret = ghl_handle_state_res_hdr(sk);
+		break;
+	case SK_STATE_HTTP_RES_BODY:
+		ret = ghl_handle_state_res_body(sk);
+		break;
+	case SK_STATE_HTTP_REQ_BODY:
+	case SK_STATE_HTTP_REQ_HDR:
+	default:
+		goto kill;
+	}
+
+	if (ret == -EAGAIN)
+		return;
+	if (ret < 0)
+		goto kill;
+	if (sk->state == SK_STATE_HTTP_RES_DONE)
+		ghl_log_http_req(ctx, sk);
+	if (sk->recv_buf.len > 0)
 		goto repeat;
 
 	return;
