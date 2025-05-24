@@ -1,6 +1,6 @@
 
 CXX = clang++
-CXXFLAGS = -Wall -Wextra -fpic -fPIC -ggdb3 -Os -std=c++17 -shared -fno-stack-protector
+CXXFLAGS = -Wall -Wextra -fpic -fPIC -ggdb3 -Os -std=gnu++17 -shared -fno-stack-protector
 LIBS = -lstdc++ -lpthread
 
 all: gwhttplogger.so
