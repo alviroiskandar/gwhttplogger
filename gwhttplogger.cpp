@@ -665,7 +665,6 @@ static int ghl_parse_chunked_body(struct chunk_st *c, struct ghl_buf *b)
 			/*
 			 * Stop early if we don't see a hexadecimal character.
 			 */
-			pr_debug(3, "zzzz");
 			if (!is_all_hex(b->buf))
 				return -EINVAL;
 
