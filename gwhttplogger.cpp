@@ -305,6 +305,130 @@ struct http_hdr_parse_st {
 	char	*val;
 };
 
+static bool is_all_hex(const char *str)
+{
+	while (*str) {
+		if (!isxdigit((unsigned char)*str))
+			return false;
+		str++;
+	}
+	return true;
+}
+
+static int ghl_parse_chunked_body(struct chunk_st *c, struct ghl_buf *b)
+{
+	if (b->len == 0)
+		return -EAGAIN;
+
+	if (c->state == CHK_STATE_LEN) {
+		char *p, *end = b->buf + b->len;
+		uint64_t chk_len;
+
+		if (b->len < 3)
+			return -EAGAIN;
+
+		p = strchr(b->buf, '\r');
+		if (!p) {
+			/*
+			 * We did not find a CR in the buffer.
+			 */
+
+			/*
+			 * More than 16 digits hex for a chunk length is
+			 * insane. We must stop early otherwise we might
+			 * blow the buffer up if we keep appending more
+			 * data indefinitely.
+			 */
+			if (b->len > 16)
+				return -EINVAL;
+
+			/*
+			 * Stop early if we don't see a hexadecimal character.
+			 */
+			if (!is_all_hex(b->buf))
+				return -EINVAL;
+
+			/*
+			 * Wait for more data. We might've hit a short recv.
+			 */
+			return -EAGAIN;
+		}
+
+		if (&p[1] >= end) {
+			/*
+			 * Expecting an LF after the CR, but we don't
+			 * have it yet, one byte missing. Wait more...
+			 */
+			return -EAGAIN;
+		}
+
+		if (p[1] != '\n')
+			return -EINVAL;
+
+		*p = '\0';
+		errno = 0;
+		chk_len = strtoull(b->buf, &end, 16);
+		if (errno || *end != '\0') {
+			/*
+			 * Invalid hexadecimal number.
+			 */
+			return -EINVAL;
+		}
+
+		if (chk_len == 0) {
+			/*
+			 * This is the last chunk, expect a final CRLF in the
+			 * next iteration state.
+			 */
+			c->state = CHK_STATE_END;
+			b->advance(p - b->buf + 2);
+			return 1;
+		}
+
+		c->remaining_length = chk_len + 2; /* +2 for CRLF */
+		c->state = CHK_STATE_DATA;
+		b->advance(p - b->buf + 2);
+		return 1;
+	} else if (c->state == CHK_STATE_DATA) {
+		if (b->len < c->remaining_length) {
+			/*
+			 * We don't have the whole chunk yet. But we can
+			 * discard the data we have so far to avoid
+			 * blowing up the buffer.
+			 */
+			c->remaining_length -= b->len;
+			b->reset();
+			return -EAGAIN;
+		}
+
+		/*
+		 * Okay, we have the whole chunk. Let's start parsing the
+		 * next chunk.
+		 */
+		b->advance(c->remaining_length);
+		c->remaining_length = 0;
+		c->state = CHK_STATE_LEN;
+		return 1;
+	} else if (c->state == CHK_STATE_END) {
+		/*
+		 * We expect the final CRLF.
+		 */
+		if (b->len < 2)
+			return -EAGAIN;
+
+		if (b->buf[0] != '\r' || b->buf[1] != '\n')
+			return -EINVAL;
+
+		b->advance(2);
+		return 0;
+	} else {
+		/*
+		* Invalid state.
+		*/
+		return -EINVAL;
+	}
+}
+
 static int ghl_parse_http_hdr(struct http_hdr_parse_st *s)
 {
 	s->i++;
@@ -383,11 +507,36 @@ static int ghl_http_req_hdr_parse_proc(struct http_hdr_parse_st &hst,
 		req.host[sizeof(req.host) - 1] = '\0';
 	} else if (!strncmp(hst.key, "content-length", 14)) {
 		char *endptr;
+
+		if (req.is_chunked) {
+			/*
+			 * Content-Length header is not allowed in chunked
+			 * transfer encoding requests. This is invalid.
+			 */
+			return -EINVAL;
+		}
+
 		errno = 0;
 		req.content_length = strtoull(hst.val, &endptr, 10);
 		req.remaining_length = req.content_length;
 		if (errno || *endptr != '\0')
 			return -EINVAL;
+	} else if (!strcmp(hst.key, "transfer-encoding")) {
+		strtolower(hst.val);
+		if (strstr(hst.val, "chunked")) {
+			if (req.content_length > 0) {
+				/*
+				 * Content-Length header is not allowed in
+				 * chunked transfer encoding requests.
+				 * This is invalid.
+				 */
+				return -EINVAL;
+			}
+
+			req.is_chunked = true;
+			req.chk.state = CHK_STATE_LEN;
+		}
+		req.content_length = (uint64_t)-1;
 	}
 
 	return 0;
@@ -462,9 +611,29 @@ static int ghl_handle_state_req_connect(struct ghl_sock *sk)
 	return 0;
 }
 
+static int ghl_handle_state_req_body_chunked(struct ghl_sock *sk)
+{
+	struct http_req *req = &sk->req_queue.back();
+
+	while (1) {
+		int nst = ghl_parse_chunked_body(&req->chk, &sk->send_buf);
+		if (nst < 0)
+			return nst;
+
+		if (!nst) {
+			sk->state = SK_STATE_HTTP_REQ_DONE;
+			req->remaining_length = 0;
+			return 0;
+		}
+	}
+}
+
 static int ghl_handle_state_req_body(struct ghl_sock *sk)
 {
 	struct http_req *req = &sk->req_queue.back();
+
+	if (req->is_chunked)
+		return ghl_handle_state_req_body_chunked(sk);
 
 	if (req->remaining_length <= sk->send_buf.len) {
 		/* Either we have the whole body or more... */
@@ -623,130 +792,6 @@ static int ghl_handle_state_res_hdr(struct ghl_sock *sk)
 		sk->state = SK_STATE_HTTP_RES_BODY;
 
 	return 0;
-}
-
-static bool is_all_hex(const char *str)
-{
-	while (*str) {
-		if (!isxdigit((unsigned char)*str))
-			return false;
-		str++;
-	}
-	return true;
-}
-
-static int ghl_parse_chunked_body(struct chunk_st *c, struct ghl_buf *b)
-{
-	if (b->len == 0)
-		return -EAGAIN;
-
-	if (c->state == CHK_STATE_LEN) {
-		char *p, *end = b->buf + b->len;
-		uint64_t chk_len;
-
-		if (b->len < 3)
-			return -EAGAIN;
-
-		p = strchr(b->buf, '\r');
-		if (!p) {
-			/*
-			 * We did not find a CR in the buffer.
-			 */
-
-			/*
-			 * More than 16 digits hex for a chunk length is
-			 * insane. We must stop early otherwise we might
-			 * blow the buffer up if we keep appending more
-			 * data indefinitely.
-			 */
-			if (b->len > 16)
-				return -EINVAL;
-
-			/*
-			 * Stop early if we don't see a hexadecimal character.
-			 */
-			if (!is_all_hex(b->buf))
-				return -EINVAL;
-
-			/*
-			 * Wait for more data. We might've hit a short recv.
-			 */
-			return -EAGAIN;
-		}
-
-		if (&p[1] >= end) {
-			/*
-			 * Expecting an LF after the CR, but we don't
-			 * have it yet, one byte missing. Wait more...
-			 */
-			return -EAGAIN;
-		}
-
-		if (p[1] != '\n')
-			return -EINVAL;
-
-		*p = '\0';
-		errno = 0;
-		chk_len = strtoull(b->buf, &end, 16);
-		if (errno || *end != '\0') {
-			/*
-			 * Invalid hexadecimal number.
-			 */
-			return -EINVAL;
-		}
-
-		if (chk_len == 0) {
-			/*
-			 * This is the last chunk, expect a final CRLF in the
-			 * next iteration state.
-			 */
-			c->state = CHK_STATE_END;
-			b->advance(p - b->buf + 2);
-			return 1;
-		}
-
-		c->remaining_length = chk_len + 2; /* +2 for CRLF */
-		c->state = CHK_STATE_DATA;
-		b->advance(p - b->buf + 2);
-		return 1;
-	} else if (c->state == CHK_STATE_DATA) {
-		if (b->len < c->remaining_length) {
-			/*
-			 * We don't have the whole chunk yet. But we can
-			 * discard the data we have so far to avoid
-			 * blowing up the buffer.
-			 */
-			c->remaining_length -= b->len;
-			b->reset();
-			return -EAGAIN;
-		}
-
-		/*
-		 * Okay, we have the whole chunk. Let's start parsing the
-		 * next chunk.
-		 */
-		b->advance(c->remaining_length);
-		c->remaining_length = 0;
-		c->state = CHK_STATE_LEN;
-		return 1;
-	} else if (c->state == CHK_STATE_END) {
-		/*
-		 * We expect the final CRLF.
-		 */
-		if (b->len < 2)
-			return -EAGAIN;
-
-		if (b->buf[0] != '\r' || b->buf[1] != '\n')
-			return -EINVAL;
-
-		b->advance(2);
-		return 0;
-	} else {
-		/*
-		* Invalid state.
-		*/
-		return -EINVAL;
-	}
 }
 
 static int ghl_handle_state_res_body_chunked(struct ghl_sock *sk)
