@@ -29,7 +29,7 @@
 #define unlikely(x)		__builtin_expect(!!(x), 0)
 #define ADDRPORT_STRLEN		(INET6_ADDRSTRLEN + (sizeof(":65535[]") - 1))
 #define MAX_HTTP_METHOD_LEN	16
-#define pr_debug(fmt, ...)	fprintf(stderr, fmt "\n", ##__VA_ARGS__)
+#define pr_debug(lvl, fmt, ...)	fprintf(stderr, fmt "\n", ##__VA_ARGS__)
 
 struct ghl_buf {
 	size_t	len;
@@ -60,8 +60,10 @@ struct ghl_buf {
 		else
 			this->len -= len;
 
-		if (this->len > 0)
+		if (this->len > 0) {
 			memmove(this->buf, this->buf + len, this->len);
+			this->buf[this->len] = '\0';
+		}
 	}
 
 	void append(const char *data, size_t data_len)
@@ -110,10 +112,23 @@ enum {
 	SK_STATE_CLOSE		= 8,
 };
 
+enum {
+	CHK_STATE_LEN	= 0,
+	CHK_STATE_DATA	= 1,
+	CHK_STATE_END	= 2,
+};
+
+struct chunk_st {
+	int		state;
+	uint64_t	remaining_length;
+};
+
 struct http_res {
 	int		status;
 	uint64_t	content_length;
-	uint64_t	remaining_content_length;
+	uint64_t	remaining_length;
+	bool		is_chunked;
+	struct chunk_st	chk;
 };
 
 struct http_req {
@@ -121,9 +136,11 @@ struct http_req {
 	std::string	uri;
 	char		host[512];
 	uint64_t	content_length;
-	uint64_t	remaining_content_length;
+	uint64_t	remaining_length;
 	struct http_res	res;
 	time_t		time;
+	bool		is_chunked;
+	struct chunk_st	chk;
 };
 
 struct ghl_sock {
@@ -188,8 +205,10 @@ static int sockaddr_to_str(const struct sockaddr *addr, char buf[ADDRPORT_STRLEN
 static void __ghl_kill_sock_trace(struct ghl_ctx *ctx, int fd)
 {
 	auto it = ctx->sockets.find(fd);
-	if (it != ctx->sockets.end())
+	if (it != ctx->sockets.end()) {
+		pr_debug(2, "Killing socket trace %d", fd);
 		ctx->sockets.erase(it);
+	}
 }
 
 static void __ghl_trace_socket(struct ghl_ctx *ctx, int fd, int domain, int type)
@@ -209,6 +228,7 @@ static void __ghl_trace_socket(struct ghl_ctx *ctx, int fd, int domain, int type
 	std::unique_ptr<struct ghl_sock> sk = std::make_unique<struct ghl_sock>();
 	sk->fd = fd;
 
+	pr_debug(2, "Tracing socket %d (domain=%d, type=%d)", fd, domain, type);
 	std::lock_guard<std::mutex> lock(ctx->sockets_lock);
 	auto it = ctx->sockets.find(fd);
 	if (it == ctx->sockets.end())
@@ -256,6 +276,7 @@ static void __ghl_trace_connect(struct ghl_ctx *ctx, int fd, int ret,
 
 	sk->state = SK_STATE_CONNECT;
 	sockaddr_to_str(addr, sk->dst_addr);
+	pr_debug(2, "Tracing connect() on socket %d to %s", fd, sk->dst_addr);
 }
 
 static void init_http_req(struct http_req *req)
@@ -264,6 +285,14 @@ static void init_http_req(struct http_req *req)
 	req->uri.clear();
 	req->host[0] = '\0';
 	req->content_length = 0;
+	req->remaining_length = 0;
+	memset(&req->chk, 0, sizeof(req->chk));
+
+	req->res.content_length = 0;
+	req->res.remaining_length = 0;
+	req->res.status = 0;
+	req->res.is_chunked = false;
+	memset(&req->res.chk, 0, sizeof(req->res.chk));
 }
 
 struct http_hdr_parse_st {
@@ -356,7 +385,7 @@ static int ghl_http_req_hdr_parse_proc(struct http_hdr_parse_st &hst,
 		char *endptr;
 		errno = 0;
 		req.content_length = strtoull(hst.val, &endptr, 10);
-		req.remaining_content_length = req.content_length;
+		req.remaining_length = req.content_length;
 		if (errno || *endptr != '\0')
 			return -EINVAL;
 	}
@@ -437,15 +466,15 @@ static int ghl_handle_state_req_body(struct ghl_sock *sk)
 {
 	struct http_req *req = &sk->req_queue.back();
 
-	if (req->remaining_content_length <= sk->send_buf.len) {
+	if (req->remaining_length <= sk->send_buf.len) {
 		/* Either we have the whole body or more... */
-		sk->send_buf.advance(req->remaining_content_length);
+		sk->send_buf.advance(req->remaining_length);
 		sk->state = SK_STATE_HTTP_REQ_DONE;
-		req->remaining_content_length = 0;
+		req->remaining_length = 0;
 		return 0;
 	} else {
 		/* We don't have the whole body yet. */
-		req->remaining_content_length -= sk->send_buf.len;
+		req->remaining_length -= sk->send_buf.len;
 		sk->send_buf.reset();
 		sk->state = SK_STATE_HTTP_REQ_BODY;
 		return -EAGAIN;
@@ -465,6 +494,8 @@ static void __ghl_trace_send(struct ghl_ctx *ctx, int fd, const char *buf,
 
 	sk = it->second.get();
 	sk->send_buf.append(buf, len);
+	pr_debug(2, "Tracing send() on socket %d to %s, len=%zd",
+		 fd, sk->dst_addr, sk->send_buf.len);
 
 repeat:
 	switch (sk->state) {
@@ -495,7 +526,7 @@ kill:
 }
 
 static int ghl_http_res_hdr_parse_proc(struct http_hdr_parse_st &hst,
-				    struct http_res &res)
+				       struct http_res &res)
 {
 	if (hst.i == 1 && !hst.key) {
 		/* Parse status code. */
@@ -520,11 +551,37 @@ static int ghl_http_res_hdr_parse_proc(struct http_hdr_parse_st &hst,
 
 	if (!strcmp(hst.key, "content-length")) {
 		char *endptr;
+
+		if (res.is_chunked) {
+			/*
+			 * Content-Length header is not allowed in chunked
+			 * transfer encoding responses. This is invalid.
+			 */
+			return -EINVAL;
+		}
+
 		errno = 0;
 		res.content_length = strtoull(hst.val, &endptr, 10);
-		res.remaining_content_length = res.content_length;
+		res.remaining_length = res.content_length;
+		res.is_chunked = false;
 		if (errno || *endptr != '\0')
 			return -EINVAL;
+	} else if (!strcmp(hst.key, "transfer-encoding")) {
+		strtolower(hst.val);
+		if (strstr(hst.val, "chunked")) {
+			if (res.content_length > 0) {
+				/*
+				 * Content-Length header is not allowed in
+				 * chunked transfer encoding responses.
+				 * This is invalid.
+				 */
+				return -EINVAL;
+			}
+
+			res.is_chunked = true;
+			res.chk.state = CHK_STATE_LEN;
+		}
+		res.content_length = (uint64_t)-1;
 	}
 
 	return 0;
@@ -568,19 +625,164 @@ static int ghl_handle_state_res_hdr(struct ghl_sock *sk)
 	return 0;
 }
 
+static bool is_all_hex(const char *str)
+{
+	while (*str) {
+		if (!isxdigit((unsigned char)*str))
+			return false;
+		str++;
+	}
+	return true;
+}
+
+static int ghl_parse_chunked_body(struct chunk_st *c, struct ghl_buf *b)
+{
+	if (b->len == 0)
+		return -EAGAIN;
+
+	if (c->state == CHK_STATE_LEN) {
+		char *p, *end = b->buf + b->len;
+		uint64_t chk_len;
+
+		if (b->len < 3)
+			return -EAGAIN;
+
+		p = strchr(b->buf, '\r');
+		if (!p) {
+			/*
+			 * We did not find a CR in the buffer.
+			 */
+
+			/*
+			 * More than 16 digits hex for a chunk length is
+			 * insane. We must stop early otherwise we might
+			 * blow the buffer up if we keep appending more
+			 * data indefinitely.
+			 */
+			if (b->len > 16)
+				return -EINVAL;
+
+			/*
+			 * Stop early if we don't see a hexadecimal character.
+			 */
+			pr_debug(3, "zzzz");
+			if (!is_all_hex(b->buf))
+				return -EINVAL;
+
+			/*
+			 * Wait for more data. We might've hit a short recv.
+			 */
+			return -EAGAIN;
+		}
+
+		if (&p[1] >= end) {
+			/*
+			 * Expecting an LF after the CR, but we don't
+			 * have it yet, one byte missing. Wait more...
+			 */
+			return -EAGAIN;
+		}
+
+		if (p[1] != '\n')
+			return -EINVAL;
+
+		*p = '\0';
+		errno = 0;
+		chk_len = strtoull(b->buf, &end, 16);
+		if (errno || *end != '\0') {
+			/*
+			 * Invalid hexadecimal number.
+			 */
+			return -EINVAL;
+		}
+
+		if (chk_len == 0) {
+			/*
+			 * This is the last chunk, expect a final CRLF in the
+			 * next iteration state.
+			 */
+			c->state = CHK_STATE_END;
+			b->advance(p - b->buf + 2);
+			return 1;
+		}
+
+		c->remaining_length = chk_len + 2; /* +2 for CRLF */
+		c->state = CHK_STATE_DATA;
+		b->advance(p - b->buf + 2);
+		return 1;
+	} else if (c->state == CHK_STATE_DATA) {
+		if (b->len < c->remaining_length) {
+			/*
+			 * We don't have the whole chunk yet. But we can
+			 * discard the data we have so far to avoid
+			 * blowing up the buffer.
+			 */
+			c->remaining_length -= b->len;
+			b->reset();
+			return -EAGAIN;
+		}
+
+		/*
+		 * Okay, we have the whole chunk. Let's start parsing the
+		 * next chunk.
+		 */
+		b->advance(c->remaining_length);
+		c->remaining_length = 0;
+		c->state = CHK_STATE_LEN;
+		return 1;
+	} else if (c->state == CHK_STATE_END) {
+		/*
+		 * We expect the final CRLF.
+		 */
+		if (b->len < 2)
+			return -EAGAIN;
+
+		if (b->buf[0] != '\r' || b->buf[1] != '\n')
+			return -EINVAL;
+
+		b->advance(2);
+		return 0;
+	} else {
+		/*
+		* Invalid state.
+		*/
+		return -EINVAL;
+	}
+}
+
+static int ghl_handle_state_res_body_chunked(struct ghl_sock *sk)
+{
+	struct http_res *res = &sk->req_queue.front().res;
+
+	while (1) {
+		int nst = ghl_parse_chunked_body(&res->chk, &sk->recv_buf);
+		if (nst < 0)
+			return nst;
+
+		if (!nst) {
+			sk->state = SK_STATE_HTTP_RES_DONE;
+			res->remaining_length = 0;
+			return 0;
+		}
+	}
+}
+
 static int ghl_handle_state_res_body(struct ghl_sock *sk)
 {
 	struct http_res *res = &sk->req_queue.front().res;
 
-	if (res->remaining_content_length <= sk->recv_buf.len) {
+	if (res->is_chunked)
+		return ghl_handle_state_res_body_chunked(sk);
+
+	if (res->remaining_length <= sk->recv_buf.len) {
 		/* Either we have the whole body or more... */
-		sk->recv_buf.advance(res->remaining_content_length);
+		sk->recv_buf.advance(res->remaining_length);
 		sk->state = SK_STATE_HTTP_RES_DONE;
-		res->remaining_content_length = 0;
+		res->remaining_length = 0;
 		return 0;
 	} else {
 		/* We don't have the whole body yet. */
-		res->remaining_content_length -= sk->recv_buf.len;
+		res->remaining_length -= sk->recv_buf.len;
 		sk->recv_buf.reset();
 		sk->state = SK_STATE_HTTP_RES_BODY;
 		return -EAGAIN;
@@ -625,6 +827,8 @@ static void __ghl_trace_recv(struct ghl_ctx *ctx, int fd, const char *buf,
 	}
 
 	sk->recv_buf.append(buf, len);
+	pr_debug(2, "Tracing recv() on socket %d from %s, len=%zd",
+		 fd, sk->dst_addr, sk->recv_buf.len);
 
 repeat:
 	switch (sk->state) {
@@ -835,6 +1039,9 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
 	register socklen_t *__addrlen __asm__ ("%r9") = addrlen;
 	ssize_t ret;
 
+	if (len > 1)
+		len = 1;
+
 	__asm__ volatile (
 		"syscall"
 		: "=a" (ret)
@@ -860,6 +1067,9 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
 	register const struct sockaddr *__dst_addr __asm__ ("%r8") = dst_addr;
 	register socklen_t __addrlen __asm__ ("%r9") = addrlen;
 	ssize_t ret;
+
+	if (len > 1)
+		len = 1;
 
 	__asm__ volatile (
 		"syscall"
