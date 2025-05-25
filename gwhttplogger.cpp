@@ -24,12 +24,18 @@
 #include <sys/socket.h>
 #include <sys/syscall.h>
 
+#define DEBUG_LEVEL		0
 #define noinline		__attribute__((__noinline__))
 #define likely(x)		__builtin_expect(!!(x), 1)
 #define unlikely(x)		__builtin_expect(!!(x), 0)
 #define ADDRPORT_STRLEN		(INET6_ADDRSTRLEN + (sizeof(":65535[]") - 1))
 #define MAX_HTTP_METHOD_LEN	16
-#define pr_debug(lvl, fmt, ...)	fprintf(stderr, fmt "\n", ##__VA_ARGS__)
+#define pr_debug(lvl, fmt, ...)				\
+do {							\
+	if (DEBUG_LEVEL >= (lvl)) {			\
+		fprintf(stderr, fmt, ##__VA_ARGS__);	\
+	}						\
+} while (0)
 
 struct ghl_buf {
 	size_t	len;
