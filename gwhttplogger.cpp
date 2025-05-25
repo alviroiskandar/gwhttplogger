@@ -1083,9 +1083,6 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
 	register socklen_t *__addrlen __asm__ ("%r9") = addrlen;
 	ssize_t ret;
 
-	if (len > 1)
-		len = 1;
-
 	__asm__ volatile (
 		"syscall"
 		: "=a" (ret)
@@ -1111,9 +1108,6 @@ ssize_t sendto(int fd, const void *buf, size_t len, int flags,
 	register const struct sockaddr *__dst_addr __asm__ ("%r8") = dst_addr;
 	register socklen_t __addrlen __asm__ ("%r9") = addrlen;
 	ssize_t ret;
-
-	if (len > 1)
-		len = 1;
 
 	__asm__ volatile (
 		"syscall"
